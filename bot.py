@@ -1,11 +1,11 @@
 """
-Telegram bot for generating daily sales reports with one editable helper message.
+Telegram bot for generating daily sales reports.
 
-Fixes:
-- main action buttons remain visible after final report
-- helper message explicitly says what to enter next
-- settings stay open until user presses ✅ Готово
-- time input accepts H:MM:SS and HH:MM:SS
+UX logic:
+- After each user answer, bot deletes the previous helper message
+- Then sends a new helper message with the next prompt
+- Final report is sent as a separate message
+- Bottom reply keyboard stays visible
 
 Env vars:
 - BOT_TOKEN (required)
@@ -26,10 +26,9 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -37,10 +36,7 @@ from telegram.ext import (
 )
 import zoneinfo
 
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ---------------- Storage ----------------
@@ -126,36 +122,6 @@ def normalize_time_hms(value: str) -> str | None:
 
 # ---------------- Keyboards ----------------
 
-MAIN_MENU_INLINE = InlineKeyboardMarkup([
-    [InlineKeyboardButton("План", callback_data="report:plan")],
-    [InlineKeyboardButton("Предварительный отчёт", callback_data="report:pred")],
-    [InlineKeyboardButton("Итоговый отчёт", callback_data="report:final")],
-    [InlineKeyboardButton("Настройки", callback_data="settings:menu")],
-])
-
-SETTINGS_INLINE = InlineKeyboardMarkup([
-    [
-        InlineKeyboardButton("Хештег сотрудника", callback_data="settings:employee_hashtag"),
-        InlineKeyboardButton("Хештег города", callback_data="settings:city_hashtag"),
-    ],
-    [
-        InlineKeyboardButton("Упоминание", callback_data="settings:mention"),
-        InlineKeyboardButton("Плановый трафик", callback_data="settings:plan_traffic"),
-    ],
-    [
-        InlineKeyboardButton("Показать настройки", callback_data="settings:show"),
-        InlineKeyboardButton("✅ Готово", callback_data="settings:done"),
-    ],
-    [
-        InlineKeyboardButton("Отмена", callback_data="menu:main"),
-    ],
-])
-
-CANCEL_INLINE = InlineKeyboardMarkup([
-    [InlineKeyboardButton("Отмена", callback_data="cancel")],
-])
-
-# Persistent reply keyboard at the bottom
 BOTTOM_MENU = ReplyKeyboardMarkup(
     [
         ["План", "Предварительный отчёт"],
@@ -164,45 +130,52 @@ BOTTOM_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+SETTINGS_MENU = ReplyKeyboardMarkup(
+    [
+        ["Хештег сотрудника", "Хештег города"],
+        ["Упоминание", "Плановый трафик"],
+        ["Показать настройки", "✅ Готово"],
+        ["Отмена"],
+    ],
+    resize_keyboard=True,
+)
+
+CANCEL_MENU = ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
+
+
 # ---------------- Prompt message helpers ----------------
 
-async def ensure_prompt_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup: InlineKeyboardMarkup) -> None:
-    prompt_chat_id = context.user_data.get("prompt_chat_id")
-    prompt_message_id = context.user_data.get("prompt_message_id")
-
+async def delete_previous_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.user_data.get("prompt_chat_id")
+    message_id = context.user_data.get("prompt_message_id")
+    if not chat_id or not message_id:
+        return
     try:
-        if prompt_chat_id and prompt_message_id:
-            await context.bot.edit_message_text(
-                chat_id=prompt_chat_id,
-                message_id=prompt_message_id,
-                text=text,
-                reply_markup=markup,
-            )
-            return
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         pass
+    context.user_data.pop("prompt_chat_id", None)
+    context.user_data.pop("prompt_message_id", None)
 
-    target_message = update.effective_message
-    sent = await target_message.reply_text(text, reply_markup=markup)
+
+async def send_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, keyboard) -> None:
+    await delete_previous_prompt(context)
+    sent = await update.effective_message.reply_text(text, reply_markup=keyboard)
     context.user_data["prompt_chat_id"] = sent.chat_id
     context.user_data["prompt_message_id"] = sent.message_id
-
-
-async def send_bottom_menu(update: Update, text: str) -> None:
-    if update.effective_message:
-        await update.effective_message.reply_text(text, reply_markup=BOTTOM_MENU)
 
 
 # ---------------- Report engine ----------------
 
 REPORT_TYPES = {
-    "plan": {"title": "ПЛАН", "mode": "plan"},
-    "pred": {"title": "ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ", "mode": "pred"},
-    "final": {"title": "ИТОГОВЫЙ ОТЧЕТ", "mode": "final"},
+    "План": {"title": "ПЛАН", "mode": "plan"},
+    "Предварительный отчёт": {"title": "ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ", "mode": "pred"},
+    "Итоговый отчёт": {"title": "ИТОГОВЫЙ ОТЧЕТ", "mode": "final"},
 }
 
 REPORT_STEPS = {
-    "common": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
+    "plan": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
+    "pred": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
     "final": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic_fact", "kz", "arrival", "departure"],
 }
 
@@ -221,26 +194,20 @@ STEP_PROMPTS = {
 
 
 def start_report(context: ContextTypes.DEFAULT_TYPE, report_key: str) -> None:
-    report_meta = REPORT_TYPES[report_key]
-    step_order = REPORT_STEPS["final"] if report_key == "final" else REPORT_STEPS["common"]
+    meta = REPORT_TYPES[report_key]
     context.user_data["mode"] = "report"
     context.user_data["report"] = {
-        "report_key": report_key,
-        "title": report_meta["title"],
-        "mode": report_meta["mode"],
+        "title": meta["title"],
+        "mode": meta["mode"],
         "date": current_report_date(),
-        "step_order": step_order,
+        "step_order": REPORT_STEPS[meta["mode"]],
         "step_index": 0,
         "values": {},
     }
 
 
-def get_current_report(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any] | None:
-    return context.user_data.get("report")
-
-
 def current_step(context: ContextTypes.DEFAULT_TYPE) -> str | None:
-    report = get_current_report(context)
+    report = context.user_data.get("report")
     if not report:
         return None
     idx = report["step_index"]
@@ -250,55 +217,13 @@ def current_step(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     return order[idx]
 
 
-def advance_report_step(context: ContextTypes.DEFAULT_TYPE) -> None:
-    report = get_current_report(context)
-    if report:
-        report["step_index"] += 1
-
-
-def build_report_preview(user_id: int, report: Dict[str, Any]) -> str:
-    settings = get_user_settings(user_id)
-    vals = report["values"]
-
-    lines = [
-        f"1. {report['title']} {report['date']}",
-        "",
-        f"1 ПЗМ {vals.get('pzm', '')}",
-        f"2 ПСМ {vals.get('psm', '')}",
-        f"3 ПСТЛ {vals.get('pstl', '')}",
-        f"4 ВСТЛ {vals.get('vstl', '')}",
-        f"5 ДОЖ {vals.get('dozh', '')}",
-        "",
-    ]
-
-    if report["mode"] == "final":
-        lines.extend([
-            f"Трафик: {vals.get('traffic_fact', '')} / {settings['plan_traffic']}",
-            f"КЗ: {vals.get('kz', '')}",
-            "",
-            f"Приход: {vals.get('arrival', '')}",
-            f"Уход: {vals.get('departure', '')}",
-            "",
-        ])
-    else:
-        lines.extend([
-            f"Трафик: {vals.get('traffic', '')}",
-            f"КЗ: {vals.get('kz', '')}",
-            "",
-        ])
-
-    lines.extend([
-        settings["employee_hashtag"],
-        settings["city_hashtag"],
-        settings["mention"],
-    ])
-    return "\n".join(lines)
+def advance_step(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["report"]["step_index"] += 1
 
 
 def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> str:
     settings = get_user_settings(user_id)
     vals = report["values"]
-
     lines = [
         f"{report['title']} {report['date']}",
         "",
@@ -309,7 +234,6 @@ def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> st
         f"4 ВСТЛ: {vals.get('vstl', '—')}",
         f"5 ДОЖ: {vals.get('dozh', '—')}",
     ]
-
     if report["mode"] == "final":
         lines.extend([
             f"Трафик факт: {vals.get('traffic_fact', '—')}",
@@ -325,15 +249,54 @@ def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> st
             f"КЗ: {vals.get('kz', '—')}",
         ])
 
-    lines.extend([
+    lines.extend(["", "Что нужно ввести сейчас:", prompt])
+    return "\n".join(lines)
+
+
+def build_report_text(user_id: int, report: Dict[str, Any]) -> str:
+    settings = get_user_settings(user_id)
+    vals = report["values"]
+    lines = [
+        f"1. {report['title']} {report['date']}",
         "",
-        f"Что нужно ввести сейчас:",
-        prompt,
+        f"1 ПЗМ {vals.get('pzm', '')}",
+        f"2 ПСМ {vals.get('psm', '')}",
+        f"3 ПСТЛ {vals.get('pstl', '')}",
+        f"4 ВСТЛ {vals.get('vstl', '')}",
+        f"5 ДОЖ {vals.get('dozh', '')}",
+        "",
+    ]
+    if report["mode"] == "final":
+        lines.extend([
+            f"Трафик: {vals.get('traffic_fact', '')} / {settings['plan_traffic']}",
+            f"КЗ: {vals.get('kz', '')}",
+            "",
+            f"Приход: {vals.get('arrival', '')}",
+            f"Уход: {vals.get('departure', '')}",
+            "",
+        ])
+    else:
+        lines.extend([
+            f"Трафик: {vals.get('traffic', '')}",
+            f"КЗ: {vals.get('kz', '')}",
+            "",
+        ])
+    lines.extend([
+        settings["employee_hashtag"],
+        settings["city_hashtag"],
+        settings["mention"],
     ])
     return "\n".join(lines)
 
 
 # ---------------- Settings engine ----------------
+
+SETTINGS_FIELDS = {
+    "Хештег сотрудника": "employee_hashtag",
+    "Хештег города": "city_hashtag",
+    "Упоминание": "mention",
+    "Плановый трафик": "plan_traffic",
+}
 
 SETTINGS_PROMPTS = {
     "employee_hashtag": "Отправь новый хештег сотрудника, например #ГригорийСотников",
@@ -341,11 +304,6 @@ SETTINGS_PROMPTS = {
     "mention": "Отправь новое упоминание, например @AleksandrSmirnov21",
     "plan_traffic": "Отправь плановый трафик в формате Ч:ММ:СС или ЧЧ:ММ:СС, например 4:00:00",
 }
-
-
-def start_settings(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["mode"] = "settings"
-    context.user_data["settings_field"] = None
 
 
 def build_settings_text(user_id: int, extra: str | None = None) -> str:
@@ -365,210 +323,146 @@ def build_settings_text(user_id: int, extra: str | None = None) -> str:
 # ---------------- Handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user:
-        get_user_settings(user.id)
-
+    get_user_settings(update.effective_user.id)
     context.user_data.clear()
-
-    helper_text = (
+    text = (
         "Привет 👋\n\n"
         "Этот бот помогает быстро формировать отчёты.\n\n"
         "Сначала зайди в «Настройки» и заполни данные один раз.\n"
         "Потом выбирай нужный тип отчёта кнопками ниже."
     )
-    await ensure_prompt_message(update, context, helper_text, MAIN_MENU_INLINE)
-    await send_bottom_menu(update, "Меню готово.")
-
-
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    user = update.effective_user
-
-    if data == "menu:main":
-        context.user_data["mode"] = None
-        context.user_data.pop("report", None)
-        context.user_data.pop("settings_field", None)
-        await ensure_prompt_message(update, context, "Главное меню. Выбери действие кнопками ниже.", MAIN_MENU_INLINE)
-        return
-
-    if data == "cancel":
-        context.user_data["mode"] = None
-        context.user_data.pop("report", None)
-        context.user_data.pop("settings_field", None)
-        await ensure_prompt_message(update, context, "Отменил. Выбери действие кнопками ниже.", MAIN_MENU_INLINE)
-        return
-
-    if data == "settings:menu":
-        start_settings(context)
-        await ensure_prompt_message(update, context, build_settings_text(user.id), SETTINGS_INLINE)
-        return
-
-    if data == "settings:show":
-        start_settings(context)
-        await ensure_prompt_message(update, context, build_settings_text(user.id), SETTINGS_INLINE)
-        return
-
-    if data == "settings:done":
-        context.user_data["mode"] = None
-        context.user_data["settings_field"] = None
-        await ensure_prompt_message(update, context, "Сохранил и вернул в главное меню.", MAIN_MENU_INLINE)
-        return
-
-    if data.startswith("settings:"):
-        field = data.split(":", 1)[1]
-        if field in SETTINGS_PROMPTS:
-            start_settings(context)
-            context.user_data["settings_field"] = field
-            await ensure_prompt_message(update, context, SETTINGS_PROMPTS[field], CANCEL_INLINE)
-        return
-
-    if data.startswith("report:"):
-        report_key = data.split(":", 1)[1]
-        if report_key in REPORT_TYPES:
-            start_report(context, report_key)
-            report = get_current_report(context)
-            step = current_step(context)
-            await ensure_prompt_message(
-                update,
-                context,
-                build_progress_text(user.id, report, STEP_PROMPTS[step]),
-                CANCEL_INLINE,
-            )
-        return
+    await send_prompt(update, context, text, BOTTOM_MENU)
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.text:
         return
 
-    text = normalize_text(update.message.text)
     user = update.effective_user
+    text = normalize_text(update.message.text)
+    mode = context.user_data.get("mode")
 
-    # Allow bottom menu buttons to behave same as inline buttons
-    if text == "План":
-        start_report(context, "plan")
-        report = get_current_report(context)
+    # Main menu entry
+    if text in REPORT_TYPES:
+        start_report(context, text)
+        report = context.user_data["report"]
         step = current_step(context)
-        await ensure_prompt_message(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_INLINE)
-        return
-
-    if text == "Предварительный отчёт":
-        start_report(context, "pred")
-        report = get_current_report(context)
-        step = current_step(context)
-        await ensure_prompt_message(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_INLINE)
-        return
-
-    if text == "Итоговый отчёт":
-        start_report(context, "final")
-        report = get_current_report(context)
-        step = current_step(context)
-        await ensure_prompt_message(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_INLINE)
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_MENU)
         return
 
     if text == "Настройки":
-        start_settings(context)
-        await ensure_prompt_message(update, context, build_settings_text(user.id), SETTINGS_INLINE)
+        context.user_data["mode"] = "settings"
+        context.user_data["settings_field"] = None
+        await send_prompt(update, context, build_settings_text(user.id), SETTINGS_MENU)
         return
 
-    mode = context.user_data.get("mode")
-
+    # Settings mode
     if mode == "settings":
-        field = context.user_data.get("settings_field")
-        if not field:
-            await ensure_prompt_message(update, context, build_settings_text(user.id), SETTINGS_INLINE)
+        if text == "Отмена":
+            context.user_data.clear()
+            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", BOTTOM_MENU)
             return
 
-        if field == "plan_traffic":
-            normalized = normalize_time_hms(text)
-            if not normalized:
-                await ensure_prompt_message(
-                    update,
-                    context,
-                    "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 4:00:00",
-                    CANCEL_INLINE,
-                )
-                return
-            text = normalized
+        if text == "✅ Готово":
+            context.user_data.clear()
+            await send_prompt(update, context, "Сохранил и вернул в меню.", BOTTOM_MENU)
+            return
 
-        settings = get_user_settings(user.id)
-        settings[field] = text
-        USER_SETTINGS[str(user.id)] = settings
-        save_settings()
-        context.user_data["settings_field"] = None
+        if text == "Показать настройки":
+            await send_prompt(update, context, build_settings_text(user.id), SETTINGS_MENU)
+            return
 
-        await ensure_prompt_message(
-            update,
-            context,
-            build_settings_text(user.id, "Сохранено. Выбери следующий пункт или нажми ✅ Готово."),
-            SETTINGS_INLINE,
-        )
+        if text in SETTINGS_FIELDS:
+            field = SETTINGS_FIELDS[text]
+            context.user_data["settings_field"] = field
+            await send_prompt(update, context, SETTINGS_PROMPTS[field], CANCEL_MENU)
+            return
+
+        field = context.user_data.get("settings_field")
+        if field:
+            if field == "plan_traffic":
+                normalized = normalize_time_hms(text)
+                if not normalized:
+                    await send_prompt(update, context, "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 4:00:00", CANCEL_MENU)
+                    return
+                text = normalized
+
+            settings = get_user_settings(user.id)
+            settings[field] = text
+            USER_SETTINGS[str(user.id)] = settings
+            save_settings()
+            context.user_data["settings_field"] = None
+
+            await send_prompt(
+                update,
+                context,
+                build_settings_text(user.id, "Сохранено. Выбери следующий пункт или нажми ✅ Готово."),
+                SETTINGS_MENU,
+            )
+            return
+
+        await send_prompt(update, context, build_settings_text(user.id), SETTINGS_MENU)
         return
 
+    # Report mode
     if mode == "report":
-        report = get_current_report(context)
-        if not report:
-            await ensure_prompt_message(update, context, "Что-то пошло не так. Возвращаю в меню.", MAIN_MENU_INLINE)
+        if text == "Отмена":
             context.user_data.clear()
+            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", BOTTOM_MENU)
+            return
+
+        report = context.user_data.get("report")
+        if not report:
+            context.user_data.clear()
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", BOTTOM_MENU)
             return
 
         step = current_step(context)
         if not step:
-            await ensure_prompt_message(update, context, "Что-то пошло не так. Возвращаю в меню.", MAIN_MENU_INLINE)
             context.user_data.clear()
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", BOTTOM_MENU)
             return
 
         if step == "traffic_fact":
             normalized = normalize_time_hms(text)
             if not normalized:
-                await ensure_prompt_message(
-                    update,
-                    context,
+                await send_prompt(
+                    update, context,
                     build_progress_text(user.id, report, "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 3:20:28"),
-                    CANCEL_INLINE,
+                    CANCEL_MENU,
                 )
                 return
             text = normalized
 
         report["values"][step] = text
-        advance_report_step(context)
+        advance_step(context)
 
         next_step = current_step(context)
         if next_step is None:
-            final_text = build_report_preview(user.id, report)
-            context.user_data["mode"] = None
-            context.user_data.pop("report", None)
+            final_text = build_report_text(user.id, report)
+            context.user_data.clear()
             await update.message.reply_text(final_text, reply_markup=BOTTOM_MENU)
-            await ensure_prompt_message(update, context, "Готово. Выбери следующее действие кнопками ниже.", MAIN_MENU_INLINE)
+            await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", BOTTOM_MENU)
             return
 
-        await ensure_prompt_message(
-            update,
-            context,
-            build_progress_text(user.id, report, STEP_PROMPTS[next_step]),
-            CANCEL_INLINE,
-        )
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[next_step]), CANCEL_MENU)
         return
 
-    await ensure_prompt_message(update, context, "Выбери действие кнопками ниже.", MAIN_MENU_INLINE)
+    # default fallback
+    await send_prompt(update, context, "Выбери действие кнопками ниже.", BOTTOM_MENU)
 
 
 def build_application():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("BOT_TOKEN не задан.")
-
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     return app
 
 
-def main() -> None:
+def main():
     app = build_application()
     logger.info("Бот запущен. Data dir: %s", DATA_DIR)
     app.run_polling(drop_pending_updates=True)
