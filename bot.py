@@ -1,4 +1,6 @@
 
+# updated version with staying in settings + flexible time
+
 import os
 import json
 import re
@@ -21,7 +23,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
 SETTINGS_MENU = ReplyKeyboardMarkup(
     [["Хештег сотрудника", "Хештег города"],
      ["Упоминание", "Плановый трафик"],
-     ["Отмена"]],
+     ["Готово", "Отмена"]],
     resize_keyboard=True
 )
 
@@ -49,52 +51,53 @@ def get_user_settings(user_id):
         "plan_traffic": "04:00:00"
     })
 
+def normalize_time(t):
+    parts = t.split(":")
+    if len(parts[0]) == 1:
+        parts[0] = "0" + parts[0]
+    return ":".join(parts)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = """Привет 👋
 
 Этот бот помогает быстро формировать отчёты.
 
-Как начать:
+1. Зайди в «Настройки»
+2. Заполни данные
+3. Нажми «Готово»
 
-1. Нажми «Настройки»
-2. Заполни:
-- хештег сотрудника (например #ГригорийСотников)
-- хештег города (например #СПБ)
-- упоминание (например @username)
-- плановый трафик (например 04:00:00)
-
-⚠️ Это делается один раз
-
-После этого:
-
-— «План» → утренний отчёт  
-— «Предварительный отчёт» → дневной  
-— «Итоговый отчёт» → вечерний  
-
-Просто вводи цифры и копируй результат."""
+Дальше просто используешь кнопки отчётов."""
     await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Выбери настройку:", reply_markup=SETTINGS_MENU)
+    await update.message.reply_text("Настройки:", reply_markup=SETTINGS_MENU)
     return SETTINGS_SELECT
 
 async def settings_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+
     mapping = {
         "Хештег сотрудника": "employee_hashtag",
         "Хештег города": "city_hashtag",
         "Упоминание": "mention",
         "Плановый трафик": "plan_traffic"
     }
-    text = update.message.text
+
     if text == "Отмена":
         return await cancel(update, context)
+
+    if text == "Готово":
+        await update.message.reply_text("Сохранили. Возвращаю в меню.", reply_markup=MAIN_MENU)
+        return ConversationHandler.END
 
     context.user_data["field"] = mapping[text]
     await update.message.reply_text("Введи значение:", reply_markup=CANCEL_MENU)
     return SETTINGS_INPUT
 
 async def settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "Отмена":
+    text = update.message.text
+
+    if text == "Отмена":
         return await cancel(update, context)
 
     user_id = update.effective_user.id
@@ -103,16 +106,17 @@ async def settings_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = get_user_settings(user_id)
 
     if field == "plan_traffic":
-        if not re.fullmatch(r"\d{2}:\d{2}:\d{2}", update.message.text):
-            await update.message.reply_text("Формат ЧЧ:ММ:СС", reply_markup=CANCEL_MENU)
+        if not re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", text):
+            await update.message.reply_text("Формат Ч:ММ:СС или ЧЧ:ММ:СС", reply_markup=CANCEL_MENU)
             return SETTINGS_INPUT
+        text = normalize_time(text)
 
-    settings[field] = update.message.text
+    settings[field] = text
     USER_SETTINGS[str(user_id)] = settings
     save_data(USER_SETTINGS)
 
-    await update.message.reply_text("Сохранено. Возвращаю в меню.", reply_markup=MAIN_MENU)
-    return ConversationHandler.END
+    await update.message.reply_text("Сохранено", reply_markup=SETTINGS_MENU)
+    return SETTINGS_SELECT
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отмена", reply_markup=MAIN_MENU)
