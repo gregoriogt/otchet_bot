@@ -1,11 +1,12 @@
 """
 Telegram bot for generating daily sales reports.
 
-UX logic:
-- After each user answer, bot deletes the previous helper message
-- Then sends a new helper message with the next prompt
-- Final report is sent as a separate message
-- Bottom reply keyboard stays visible
+Changes:
+- План builds instantly from per-user constants in settings
+- No "Ожидаемые поступления" and no "Итого"
+- Предварительный отчёт and Итоговый отчёт stay interactive
+- Settings include both common constants and plan constants
+- Helper prompt message is replaced each step to keep chat cleaner
 
 Env vars:
 - BOT_TOKEN (required)
@@ -60,7 +61,13 @@ DEFAULT_SETTINGS = {
     "employee_hashtag": "#ИмяФамилия",
     "city_hashtag": "#Город",
     "mention": "@username",
-    "plan_traffic": "04:00:00",
+    "plan_pzm": "4",
+    "plan_psm": "2",
+    "plan_pstl": "0",
+    "plan_vstl": "0",
+    "plan_dozh": "0",
+    "plan_traffic": "03:00:00",
+    "plan_kz": "200",
 }
 
 
@@ -133,7 +140,10 @@ BOTTOM_MENU = ReplyKeyboardMarkup(
 SETTINGS_MENU = ReplyKeyboardMarkup(
     [
         ["Хештег сотрудника", "Хештег города"],
-        ["Упоминание", "Плановый трафик"],
+        ["Упоминание", "План ПЗМ"],
+        ["План ПСМ", "План ПСТЛ"],
+        ["План ВСТЛ", "План ДОЖ"],
+        ["План трафик", "План КЗ"],
         ["Показать настройки", "✅ Готово"],
         ["Отмена"],
     ],
@@ -143,7 +153,7 @@ SETTINGS_MENU = ReplyKeyboardMarkup(
 CANCEL_MENU = ReplyKeyboardMarkup([["Отмена"]], resize_keyboard=True)
 
 
-# ---------------- Prompt message helpers ----------------
+# ---------------- Prompt helpers ----------------
 
 async def delete_previous_prompt(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.user_data.get("prompt_chat_id")
@@ -167,14 +177,7 @@ async def send_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
 
 # ---------------- Report engine ----------------
 
-REPORT_TYPES = {
-    "План": {"title": "ПЛАН", "mode": "plan"},
-    "Предварительный отчёт": {"title": "ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ", "mode": "pred"},
-    "Итоговый отчёт": {"title": "ИТОГОВЫЙ ОТЧЕТ", "mode": "final"},
-}
-
 REPORT_STEPS = {
-    "plan": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
     "pred": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
     "final": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic_fact", "kz", "arrival", "departure"],
 }
@@ -193,14 +196,13 @@ STEP_PROMPTS = {
 }
 
 
-def start_report(context: ContextTypes.DEFAULT_TYPE, report_key: str) -> None:
-    meta = REPORT_TYPES[report_key]
+def start_report(context: ContextTypes.DEFAULT_TYPE, mode: str, title: str) -> None:
     context.user_data["mode"] = "report"
     context.user_data["report"] = {
-        "title": meta["title"],
-        "mode": meta["mode"],
+        "title": title,
+        "mode": mode,
         "date": current_report_date(),
-        "step_order": REPORT_STEPS[meta["mode"]],
+        "step_order": REPORT_STEPS[mode],
         "step_index": 0,
         "values": {},
     }
@@ -248,8 +250,28 @@ def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> st
             f"Трафик: {vals.get('traffic', '—')}",
             f"КЗ: {vals.get('kz', '—')}",
         ])
-
     lines.extend(["", "Что нужно ввести сейчас:", prompt])
+    return "\n".join(lines)
+
+
+def build_plan_text(user_id: int) -> str:
+    s = get_user_settings(user_id)
+    lines = [
+        f"ПЛАН {current_report_date()}",
+        "",
+        f"1 ПЗМ {s['plan_pzm']}",
+        f"2 ПСМ {s['plan_psm']}",
+        f"3 ПСТЛ {s['plan_pstl']}",
+        f"4 ВСТЛ {s['plan_vstl']}",
+        f"5 ДОЖ {s['plan_dozh']}",
+        "",
+        f"Трафик: {s['plan_traffic']}",
+        f"КЗ: {s['plan_kz']}",
+        "",
+        s["employee_hashtag"],
+        s["city_hashtag"],
+        s["mention"],
+    ]
     return "\n".join(lines)
 
 
@@ -257,7 +279,7 @@ def build_report_text(user_id: int, report: Dict[str, Any]) -> str:
     settings = get_user_settings(user_id)
     vals = report["values"]
     lines = [
-        f"1. {report['title']} {report['date']}",
+        f"{report['title']} {report['date']}",
         "",
         f"1 ПЗМ {vals.get('pzm', '')}",
         f"2 ПСМ {vals.get('psm', '')}",
@@ -295,14 +317,26 @@ SETTINGS_FIELDS = {
     "Хештег сотрудника": "employee_hashtag",
     "Хештег города": "city_hashtag",
     "Упоминание": "mention",
-    "Плановый трафик": "plan_traffic",
+    "План ПЗМ": "plan_pzm",
+    "План ПСМ": "plan_psm",
+    "План ПСТЛ": "plan_pstl",
+    "План ВСТЛ": "plan_vstl",
+    "План ДОЖ": "plan_dozh",
+    "План трафик": "plan_traffic",
+    "План КЗ": "plan_kz",
 }
 
 SETTINGS_PROMPTS = {
     "employee_hashtag": "Отправь новый хештег сотрудника, например #ГригорийСотников",
     "city_hashtag": "Отправь новый хештег города, например #СПБ",
     "mention": "Отправь новое упоминание, например @AleksandrSmirnov21",
-    "plan_traffic": "Отправь плановый трафик в формате Ч:ММ:СС или ЧЧ:ММ:СС, например 4:00:00",
+    "plan_pzm": "Отправь плановое значение для 1 ПЗМ",
+    "plan_psm": "Отправь плановое значение для 2 ПСМ",
+    "plan_pstl": "Отправь плановое значение для 3 ПСТЛ",
+    "plan_vstl": "Отправь плановое значение для 4 ВСТЛ",
+    "plan_dozh": "Отправь плановое значение для 5 ДОЖ",
+    "plan_traffic": "Отправь плановый трафик в формате Ч:ММ:СС или ЧЧ:ММ:СС, например 3:00:00",
+    "plan_kz": "Отправь плановое значение КЗ",
 }
 
 
@@ -312,8 +346,14 @@ def build_settings_text(user_id: int, extra: str | None = None) -> str:
         "Настройки:\n\n"
         f"Хештег сотрудника: {s['employee_hashtag']}\n"
         f"Хештег города: {s['city_hashtag']}\n"
-        f"Упоминание: {s['mention']}\n"
-        f"Плановый трафик: {s['plan_traffic']}"
+        f"Упоминание: {s['mention']}\n\n"
+        f"План ПЗМ: {s['plan_pzm']}\n"
+        f"План ПСМ: {s['plan_psm']}\n"
+        f"План ПСТЛ: {s['plan_pstl']}\n"
+        f"План ВСТЛ: {s['plan_vstl']}\n"
+        f"План ДОЖ: {s['plan_dozh']}\n"
+        f"План трафик: {s['plan_traffic']}\n"
+        f"План КЗ: {s['plan_kz']}"
     )
     if extra:
         text += f"\n\n{extra}"
@@ -328,8 +368,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "Привет 👋\n\n"
         "Этот бот помогает быстро формировать отчёты.\n\n"
-        "Сначала зайди в «Настройки» и заполни данные один раз.\n"
-        "Потом выбирай нужный тип отчёта кнопками ниже."
+        "Сначала зайди в «Настройки» и один раз заполни свои константы.\n"
+        "После этого кнопка «План» будет сразу собирать готовый утренний отчёт.\n"
+        "Предварительный и итоговый отчёты остаются пошаговыми."
     )
     await send_prompt(update, context, text, BOTTOM_MENU)
 
@@ -343,8 +384,21 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     mode = context.user_data.get("mode")
 
     # Main menu entry
-    if text in REPORT_TYPES:
-        start_report(context, text)
+    if text == "План":
+        await delete_previous_prompt(context)
+        await update.message.reply_text(build_plan_text(user.id), reply_markup=BOTTOM_MENU)
+        await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", BOTTOM_MENU)
+        return
+
+    if text == "Предварительный отчёт":
+        start_report(context, "pred", "ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ")
+        report = context.user_data["report"]
+        step = current_step(context)
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_MENU)
+        return
+
+    if text == "Итоговый отчёт":
+        start_report(context, "final", "ИТОГОВЫЙ ОТЧЕТ")
         report = context.user_data["report"]
         step = current_step(context)
         await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_MENU)
@@ -383,7 +437,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if field == "plan_traffic":
                 normalized = normalize_time_hms(text)
                 if not normalized:
-                    await send_prompt(update, context, "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 4:00:00", CANCEL_MENU)
+                    await send_prompt(update, context, "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 3:00:00", CANCEL_MENU)
                     return
                 text = normalized
 
@@ -441,6 +495,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if next_step is None:
             final_text = build_report_text(user.id, report)
             context.user_data.clear()
+            await delete_previous_prompt(context)
             await update.message.reply_text(final_text, reply_markup=BOTTOM_MENU)
             await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", BOTTOM_MENU)
             return
