@@ -1,18 +1,11 @@
 """
 Telegram bot for generating daily sales reports.
 
-Changes:
+Fix:
+- old user settings are auto-merged with new default fields
 - План builds instantly from per-user constants in settings
 - No "Ожидаемые поступления" and no "Итого"
 - Предварительный отчёт and Итоговый отчёт stay interactive
-- Settings include both common constants and plan constants
-- Helper prompt message is replaced each step to keep chat cleaner
-
-Env vars:
-- BOT_TOKEN (required)
-- APP_TIMEZONE (optional, default: Europe/Moscow)
-- APP_DATA_DIR (optional)
-- RAILWAY_VOLUME_MOUNT_PATH (optional)
 """
 
 from __future__ import annotations
@@ -71,13 +64,25 @@ DEFAULT_SETTINGS = {
 }
 
 
+def merge_with_defaults(data: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    merged: Dict[str, Dict[str, str]] = {}
+    for user_id, settings in data.items():
+        current = deepcopy(DEFAULT_SETTINGS)
+        if isinstance(settings, dict):
+            current.update(settings)
+        merged[user_id] = current
+    return merged
+
+
 def load_settings() -> Dict[str, Dict[str, str]]:
     if not SETTINGS_PATH.exists():
         return {}
     try:
         with SETTINGS_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if isinstance(data, dict):
+            return merge_with_defaults(data)
+        return {}
     except Exception as e:
         logger.warning("Не удалось прочитать settings file: %s", e)
         return {}
@@ -97,6 +102,11 @@ def get_user_settings(user_id: int) -> Dict[str, str]:
     if key not in USER_SETTINGS:
         USER_SETTINGS[key] = deepcopy(DEFAULT_SETTINGS)
         save_settings()
+    else:
+        # backfill missing keys for older profiles
+        merged = deepcopy(DEFAULT_SETTINGS)
+        merged.update(USER_SETTINGS[key])
+        USER_SETTINGS[key] = merged
     return USER_SETTINGS[key]
 
 
@@ -364,6 +374,7 @@ def build_settings_text(user_id: int, extra: str | None = None) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     get_user_settings(update.effective_user.id)
+    save_settings()
     context.user_data.clear()
     text = (
         "Привет 👋\n\n"
@@ -380,6 +391,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user = update.effective_user
+    # ensure old profiles are migrated before any action
+    get_user_settings(user.id)
+    save_settings()
+
     text = normalize_text(update.message.text)
     mode = context.user_data.get("mode")
 
