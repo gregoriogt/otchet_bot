@@ -1,12 +1,6 @@
-"""
-Telegram bot for generating daily sales reports.
 
-UX:
-- Main menu stays simple
-- Settings are filled sequentially, like report flow
-- Plan is built instantly from per-user constants
-- In pred/final reports, fields whose plan value is "0" are skipped
-- Helper prompt message is replaced each step to keep chat cleaner
+"""
+Telegram bot for generating daily and call reports.
 
 Env vars:
 - BOT_TOKEN (required)
@@ -39,6 +33,7 @@ import zoneinfo
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ---------------- Storage ----------------
 
@@ -82,19 +77,6 @@ SETTINGS_ORDER = [
     "plan_traffic",
     "plan_kz",
 ]
-
-SETTINGS_LABELS = {
-    "employee_hashtag": "Хештег сотрудника",
-    "city_hashtag": "Хештег города",
-    "mention": "Упоминание",
-    "plan_pzm": "План ПЗМ",
-    "plan_psm": "План ПСМ",
-    "plan_pstl": "План ПСТЛ",
-    "plan_vstl": "План ВСТЛ",
-    "plan_dozh": "План ДОЖ",
-    "plan_traffic": "План трафик",
-    "plan_kz": "План КЗ",
-}
 
 SETTINGS_PROMPTS = {
     "employee_hashtag": "Введи хештег сотрудника, например #ГригорийСотников",
@@ -182,12 +164,36 @@ def normalize_time_hms(value: str) -> str | None:
     return f"{int(hh):02d}:{mm}:{ss}"
 
 
+def normalize_time_hm(value: str) -> str | None:
+    value = normalize_text(value)
+    if not re.fullmatch(r"\d{1,2}:\d{2}", value):
+        return None
+    hh, mm = value.split(":")
+    return f"{int(hh):02d}:{mm}"
+
+
 # ---------------- Keyboards ----------------
 
-BOTTOM_MENU = ReplyKeyboardMarkup(
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        ["Ежедневные отчёты", "Отчёт ПЗМ"],
+        ["Отчёт ПСМ", "Настройки"],
+    ],
+    resize_keyboard=True,
+)
+
+DAILY_MENU = ReplyKeyboardMarkup(
     [
         ["План", "Предварительный отчёт"],
-        ["Итоговый отчёт", "Настройки"],
+        ["Итоговый отчёт", "Назад в главное меню"],
+    ],
+    resize_keyboard=True,
+)
+
+NAV_MENU = ReplyKeyboardMarkup(
+    [
+        ["⬅️ Назад", "➡️ Вперёд"],
+        ["Отмена"],
     ],
     resize_keyboard=True,
 )
@@ -276,7 +282,7 @@ def build_settings_summary(user_id: int, extra: str | None = None) -> str:
     return "\n".join(lines)
 
 
-# ---------------- Report flow ----------------
+# ---------------- Daily report flow ----------------
 
 BASE_REPORT_STEPS = {
     "pred": ["pzm", "psm", "pstl", "vstl", "dozh", "traffic", "kz"],
@@ -304,8 +310,8 @@ def build_step_order_for_user(user_id: int, mode: str) -> List[str]:
         if field in {"pzm", "psm", "pstl", "vstl", "dozh"}:
             if field_enabled_for_reports(settings, field):
                 order.append(field)
-        else:
-            order.append(field)
+            continue
+        order.append(field)
     return order
 
 
@@ -336,17 +342,18 @@ def advance_step(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["report"]["step_index"] += 1
 
 
+def step_back(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["report"]["step_index"] = max(0, context.user_data["report"]["step_index"] - 1)
+
+
 def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> str:
     settings = get_user_settings(user_id)
     vals = report["values"]
-
     lines = [f"{report['title']} {report['date']}", "", "Уже введено:"]
 
-    shown_any = False
     for field, label in [("pzm", "1 ПЗМ"), ("psm", "2 ПСМ"), ("pstl", "3 ПСТЛ"), ("vstl", "4 ВСТЛ"), ("dozh", "5 ДОЖ")]:
         if field in report["step_order"]:
             lines.append(f"{label}: {vals.get(field, '—')}")
-            shown_any = True
 
     if report["mode"] == "final":
         lines.extend([
@@ -363,7 +370,13 @@ def build_progress_text(user_id: int, report: Dict[str, Any], prompt: str) -> st
             f"КЗ: {vals.get('kz', '—')}",
         ])
 
-    lines.extend(["", "Что нужно ввести сейчас:", prompt])
+    lines.extend([
+        "",
+        "Что нужно ввести сейчас:",
+        prompt,
+        "",
+        "Можно отправить ответ сообщением или использовать кнопки навигации.",
+    ])
     return "\n".join(lines)
 
 
@@ -391,7 +404,6 @@ def build_plan_text(user_id: int) -> str:
 def build_report_text(user_id: int, report: Dict[str, Any]) -> str:
     settings = get_user_settings(user_id)
     vals = report["values"]
-
     lines = [f"{report['title']} {report['date']}", ""]
 
     for field, label in [("pzm", "1 ПЗМ"), ("psm", "2 ПСМ"), ("pstl", "3 ПСТЛ"), ("vstl", "4 ВСТЛ"), ("dozh", "5 ДОЖ")]:
@@ -424,21 +436,144 @@ def build_report_text(user_id: int, report: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# ---------------- Call report flow ----------------
+
+CALL_REPORT_TEMPLATES = {
+    "call_pzm": {
+        "title": "ПЗМ",
+        "steps": [
+            ("expertise", "1.ЭКСПЕРТНОСТЬ:"),
+            ("request", "2.ЗАПРОС/ ОТВЕТ КЛИЕНТА, ЧТО ОН ХОЧЕТ ОТ НОВОГО БИЗНЕСА:"),
+            ("money", "3.ДЕНЬГИ/ОТКУДА:"),
+            ("urgency", "4.СРОЧНОСТЬ (суперсезон в рынке):"),
+            ("reaction", "5.РЕАКЦИЯ КЛИЕНТА (ВОПРОСЫ И ВОЗРАЖЕНИЯ) И КАК Я ОТРАБОТАЛ(А):"),
+            ("result", "6.ДОГОВОРЕННОСТЬ ПО ИТОГУ ПЗМ:"),
+            ("comment", "комментарии:"),
+        ],
+    },
+    "call_psm": {
+        "title": "ПСМ",
+        "steps": [
+            ("lk", "1. ВЫСТРОЕН ЛИ ЛК ?"),
+            ("tgk", "2. ПОДПИСАН НА ТГК ? СМОТРЕЛ ПРЯМЫЕ ЭФИРЫ ?"),
+            ("lpr", "3. КТО ЛПР:"),
+            ("pain", "4. БОЛЬ:"),
+            ("request", "5. ЗАПРОС/ПОТРЕБНОСТЬ ОТВЕТ КЛИЕНТА, ЧТО ОН ХОЧЕТ ОТ НОВОГО БИЗНЕСА:"),
+            ("demand", "6.1 СПРОСУ:"),
+            ("strengths", "6.2 СИЛЬНЫЕ СТОРОНЫ БИЗНЕСА:"),
+            ("finance", "6.3 ПОНИМАНИЕ ФИН МОДЕЛИ:"),
+            ("money", "7. ДЕНЬГИ/ОТКУДА:"),
+            ("urgency", "8. СРОЧНОСТЬ:"),
+            ("reaction", "9.РЕАКЦИЯ КЛИЕНТА (ВОПРОСЫ И ВОЗРАЖЕНИЯ) И КАК Я ОТРАБОТАЛ(А):"),
+            ("result", "10. ДОГОВОРЕННОСТЬ ПО ИТОГУ ПСМ:"),
+            ("comment", "комменатарии:"),
+        ],
+    },
+}
+
+
+def start_call_report(context: ContextTypes.DEFAULT_TYPE, report_type: str) -> None:
+    template = CALL_REPORT_TEMPLATES[report_type]
+    context.user_data["mode"] = "call_report"
+    context.user_data["call_report"] = {
+        "report_type": report_type,
+        "title": template["title"],
+        "date": current_report_date(),
+        "steps": template["steps"],
+        "step_index": 0,
+        "values": {},
+    }
+
+
+def current_call_step(context: ContextTypes.DEFAULT_TYPE):
+    report = context.user_data.get("call_report")
+    if not report:
+        return None
+    idx = report["step_index"]
+    steps = report["steps"]
+    if idx >= len(steps):
+        return None
+    return steps[idx]
+
+
+def advance_call_step(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["call_report"]["step_index"] += 1
+
+
+def step_back_call(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["call_report"]["step_index"] = max(0, context.user_data["call_report"]["step_index"] - 1)
+
+
+def build_call_progress_text(report: Dict[str, Any]) -> str:
+    vals = report["values"]
+    idx = report["step_index"]
+    _, label = report["steps"][idx]
+
+    lines = [f"{report['title']} {report['date']}", "", "Уже введено:"]
+    for existing_key, existing_label in report["steps"]:
+        lines.append(f"• {existing_label} {vals.get(existing_key, '—')}")
+
+    lines.extend([
+        "",
+        f"Текущий вопрос ({idx + 1}/{len(report['steps'])}):",
+        label,
+        "",
+        "Напиши ответ сообщением или используй кнопки навигации.",
+    ])
+    return "\n".join(lines)
+
+
+def build_call_report_text(report: Dict[str, Any]) -> str:
+    vals = report["values"]
+
+    if report["report_type"] == "call_pzm":
+        lines = [
+            "ПЗМ",
+            f"1.ЭКСПЕРТНОСТЬ: {vals.get('expertise', '')}",
+            f"2.ЗАПРОС/ ОТВЕТ КЛИЕНТА, ЧТО ОН ХОЧЕТ ОТ НОВОГО БИЗНЕСА: {vals.get('request', '')}",
+            f"3.ДЕНЬГИ/ОТКУДА: {vals.get('money', '')}",
+            f"4.СРОЧНОСТЬ (суперсезон в рынке): {vals.get('urgency', '')}",
+            f"5.РЕАКЦИЯ КЛИЕНТА (ВОПРОСЫ И ВОЗРАЖЕНИЯ) И КАК Я ОТРАБОТАЛ(А): {vals.get('reaction', '')}",
+            f"6.ДОГОВОРЕННОСТЬ ПО ИТОГУ ПЗМ: {vals.get('result', '')}",
+            f"комментарии: {vals.get('comment', '')}",
+        ]
+        return "\n".join(lines)
+
+    lines = [
+        "ПСМ",
+        f"1. ВЫСТРОЕН ЛИ ЛК ? {vals.get('lk', '')}",
+        f"2. ПОДПИСАН НА ТГК ? СМОТРЕЛ ПРЯМЫЕ ЭФИРЫ ? {vals.get('tgk', '')}",
+        f"3. КТО ЛПР: {vals.get('lpr', '')}",
+        f"4. БОЛЬ: {vals.get('pain', '')}",
+        f"5. ЗАПРОС/ПОТРЕБНОСТЬ ОТВЕТ КЛИЕНТА, ЧТО ОН ХОЧЕТ ОТ НОВОГО БИЗНЕСА: {vals.get('request', '')}",
+        "6. СЛОЖИЛОСЬ ЛИ ПОНИМАНИЕ У КЛИЕНТА ПО",
+        f"6.1 СПРОСУ {vals.get('demand', '')}",
+        f"6.2 СИЛЬНЫЕ СТОРОНЫ БИЗНЕСА {vals.get('strengths', '')}",
+        f"6.3 ПОНИМАНИЕ ФИН МОДЕЛИ {vals.get('finance', '')}",
+        f"7. ДЕНЬГИ/ОТКУДА {vals.get('money', '')}",
+        f"8. СРОЧНОСТЬ: {vals.get('urgency', '')}",
+        f"9.РЕАКЦИЯ КЛИЕНТА (ВОПРОСЫ И ВОЗРАЖЕНИЯ) И КАК Я ОТРАБОТАЛ(А): {vals.get('reaction', '')}",
+        f"10. ДОГОВОРЕННОСТЬ ПО ИТОГУ ПСМ: {vals.get('result', '')}",
+        f"комменатарии: {vals.get('comment', '')}",
+    ]
+    return "\n".join(lines)
+
+
 # ---------------- Handlers ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     get_user_settings(update.effective_user.id)
     save_settings()
     context.user_data.clear()
+
     text = (
-        "Привет 👋\n\n"
-        "Этот бот помогает быстро формировать отчёты.\n\n"
-        "Сначала зайди в «Настройки» и один раз заполни свои константы.\n"
-        "После этого кнопка «План» будет сразу собирать готовый утренний отчёт.\n"
-        "Предварительный и итоговый отчёты остаются пошаговыми.\n\n"
-        "Если в плане у какого-то блока стоит 0, в остальных отчётах бот этот блок не спросит."
+        "Привет\n\n"
+        "Бот умеет собирать ежедневные отчёты, а также отдельные отчёты ПЗМ и ПСМ.\n\n"
+        "Сначала один раз заполни настройки.\n"
+        "Потом выбирай нужный режим в меню.\n\n"
+        "В ежедневных отчётах блоки с планом 0 автоматически пропускаются."
     )
-    await send_prompt(update, context, text, BOTTOM_MENU)
+    await send_prompt(update, context, text, MAIN_MENU)
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -452,24 +587,46 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = normalize_text(update.message.text)
     mode = context.user_data.get("mode")
 
+    if text == "Ежедневные отчёты":
+        context.user_data.clear()
+        await send_prompt(update, context, "Выбери тип ежедневного отчёта.", DAILY_MENU)
+        return
+
+    if text == "Назад в главное меню":
+        context.user_data.clear()
+        await send_prompt(update, context, "Вернул в главное меню.", MAIN_MENU)
+        return
+
     if text == "План":
         await delete_previous_prompt(context)
-        await update.message.reply_text(build_plan_text(user.id), reply_markup=BOTTOM_MENU)
-        await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", BOTTOM_MENU)
+        await update.message.reply_text(build_plan_text(user.id), reply_markup=DAILY_MENU)
+        await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", DAILY_MENU)
         return
 
     if text == "Предварительный отчёт":
         start_report(context, user.id, "pred", "ПРЕДВАРИТЕЛЬНЫЙ ОТЧЁТ")
         report = context.user_data["report"]
         step = current_step(context)
-        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_MENU)
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), NAV_MENU)
         return
 
     if text == "Итоговый отчёт":
-        start_report(context, user.id, "final", "ИТОГОВЫЙ ОТЧЕТ")
+        start_report(context, user.id, "final", "ИТОГОВЫЙ ОТЧЁТ")
         report = context.user_data["report"]
         step = current_step(context)
-        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), CANCEL_MENU)
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), NAV_MENU)
+        return
+
+    if text == "Отчёт ПЗМ":
+        start_call_report(context, "call_pzm")
+        report = context.user_data["call_report"]
+        await send_prompt(update, context, build_call_progress_text(report), NAV_MENU)
+        return
+
+    if text == "Отчёт ПСМ":
+        start_call_report(context, "call_psm")
+        report = context.user_data["call_report"]
+        await send_prompt(update, context, build_call_progress_text(report), NAV_MENU)
         return
 
     if text == "Настройки":
@@ -478,17 +635,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await send_prompt(update, context, SETTINGS_PROMPTS[field], CANCEL_MENU)
         return
 
-    # Settings mode
     if mode == "settings":
         if text == "Отмена":
             context.user_data.clear()
-            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", BOTTOM_MENU)
+            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", MAIN_MENU)
             return
 
         field = current_settings_field(context)
         if not field:
             context.user_data.clear()
-            await send_prompt(update, context, build_settings_summary(user.id, "Сохранил и вернул в меню."), BOTTOM_MENU)
+            await send_prompt(update, context, build_settings_summary(user.id, "Сохранил и вернул в меню."), MAIN_MENU)
             return
 
         value = text
@@ -508,39 +664,77 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         next_field = current_settings_field(context)
         if next_field is None:
             context.user_data.clear()
-            await send_prompt(update, context, build_settings_summary(user.id, "Сохранил и вернул в меню."), BOTTOM_MENU)
+            await send_prompt(update, context, build_settings_summary(user.id, "Сохранил и вернул в меню."), MAIN_MENU)
             return
 
         await send_prompt(update, context, SETTINGS_PROMPTS[next_field], CANCEL_MENU)
         return
 
-    # Report mode
     if mode == "report":
         if text == "Отмена":
             context.user_data.clear()
-            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", BOTTOM_MENU)
+            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", DAILY_MENU)
             return
 
         report = context.user_data.get("report")
         if not report:
             context.user_data.clear()
-            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", BOTTOM_MENU)
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", MAIN_MENU)
+            return
+
+        if text == "⬅️ Назад":
+            step_back(context)
+            step = current_step(context)
+            if step is None and report["step_order"]:
+                step = report["step_order"][0]
+            if step is None:
+                context.user_data.clear()
+                await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", DAILY_MENU)
+                return
+            await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[step]), NAV_MENU)
+            return
+
+        if text == "➡️ Вперёд":
+            advance_step(context)
+            next_step = current_step(context)
+            if next_step is None:
+                final_text = build_report_text(user.id, report)
+                context.user_data.clear()
+                await delete_previous_prompt(context)
+                await update.message.reply_text(final_text, reply_markup=DAILY_MENU)
+                await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", DAILY_MENU)
+                return
+            await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[next_step]), NAV_MENU)
             return
 
         step = current_step(context)
         if not step:
             context.user_data.clear()
-            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", BOTTOM_MENU)
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", MAIN_MENU)
             return
 
         value = text
+
         if step == "traffic_fact":
             normalized = normalize_time_hms(text)
             if not normalized:
                 await send_prompt(
-                    update, context,
+                    update,
+                    context,
                     build_progress_text(user.id, report, "Нужен формат Ч:ММ:СС или ЧЧ:ММ:СС, например 3:20:28"),
-                    CANCEL_MENU,
+                    NAV_MENU,
+                )
+                return
+            value = normalized
+
+        if step in {"arrival", "departure"}:
+            normalized = normalize_time_hm(text)
+            if not normalized:
+                await send_prompt(
+                    update,
+                    context,
+                    build_progress_text(user.id, report, "Нужен формат Ч:ММ, например 8:25"),
+                    NAV_MENU,
                 )
                 return
             value = normalized
@@ -553,29 +747,78 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             final_text = build_report_text(user.id, report)
             context.user_data.clear()
             await delete_previous_prompt(context)
-            await update.message.reply_text(final_text, reply_markup=BOTTOM_MENU)
-            await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", BOTTOM_MENU)
+            await update.message.reply_text(final_text, reply_markup=DAILY_MENU)
+            await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", DAILY_MENU)
             return
 
-        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[next_step]), CANCEL_MENU)
+        await send_prompt(update, context, build_progress_text(user.id, report, STEP_PROMPTS[next_step]), NAV_MENU)
         return
 
-    await send_prompt(update, context, "Выбери действие кнопками ниже.", BOTTOM_MENU)
+    if mode == "call_report":
+        if text == "Отмена":
+            context.user_data.clear()
+            await send_prompt(update, context, "Отменил. Выбери действие кнопками ниже.", MAIN_MENU)
+            return
+
+        report = context.user_data.get("call_report")
+        if not report:
+            context.user_data.clear()
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", MAIN_MENU)
+            return
+
+        if text == "⬅️ Назад":
+            step_back_call(context)
+            await send_prompt(update, context, build_call_progress_text(report), NAV_MENU)
+            return
+
+        if text == "➡️ Вперёд":
+            advance_call_step(context)
+            next_step = current_call_step(context)
+            if next_step is None:
+                final_text = build_call_report_text(report)
+                context.user_data.clear()
+                await delete_previous_prompt(context)
+                await update.message.reply_text(final_text, reply_markup=MAIN_MENU)
+                await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", MAIN_MENU)
+                return
+            await send_prompt(update, context, build_call_progress_text(report), NAV_MENU)
+            return
+
+        step = current_call_step(context)
+        if not step:
+            context.user_data.clear()
+            await send_prompt(update, context, "Что-то пошло не так. Выбери действие кнопками ниже.", MAIN_MENU)
+            return
+
+        step_key, _ = step
+        report["values"][step_key] = text
+        advance_call_step(context)
+
+        next_step = current_call_step(context)
+        if next_step is None:
+            final_text = build_call_report_text(report)
+            context.user_data.clear()
+            await delete_previous_prompt(context)
+            await update.message.reply_text(final_text, reply_markup=MAIN_MENU)
+            await send_prompt(update, context, "Готово. Выбери следующее действие кнопками ниже.", MAIN_MENU)
+            return
+
+        await send_prompt(update, context, build_call_progress_text(report), NAV_MENU)
+        return
+
+    await send_prompt(update, context, "Выбери действие кнопками ниже.", MAIN_MENU)
 
 
-def build_application():
+def main() -> None:
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        raise RuntimeError("BOT_TOKEN не задан.")
+        raise RuntimeError("BOT_TOKEN is required")
+
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-    return app
 
-
-def main():
-    app = build_application()
-    logger.info("Бот запущен. Data dir: %s", DATA_DIR)
+    logger.info("Bot started")
     app.run_polling(drop_pending_updates=True)
 
 
